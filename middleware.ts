@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
-import { randomUUID } from "crypto";
 
 export const SESSION_COOKIE = "sid";
 
@@ -11,7 +10,7 @@ export function middleware(request: NextRequest) {
   const response = NextResponse.next();
 
   if (!request.cookies.get(SESSION_COOKIE)) {
-    response.cookies.set(SESSION_COOKIE, randomUUID(), {
+    response.cookies.set(SESSION_COOKIE, crypto.randomUUID(), {
       httpOnly: true,
       sameSite: "lax",
       path: "/",
