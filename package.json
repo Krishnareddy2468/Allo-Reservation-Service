@@ -9,9 +9,15 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:migrate:deploy": "prisma migrate deploy",
+    "db:studio": "prisma studio",
+    "db:reset": "prisma migrate reset"
   },
   "dependencies": {
+    "@prisma/client": "^6.19.3",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^0.460.0",
@@ -31,6 +37,7 @@
     "eslint-config-prettier": "^9.1.0",
     "prettier": "^3.4.0",
     "prettier-plugin-tailwindcss": "^0.6.9",
+    "prisma": "^6.19.3",
     "tailwindcss": "^4.0.0",
     "typescript": "^5.7.0"
   },
