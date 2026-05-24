@@ -29,15 +29,16 @@ export async function sweepExpiredReservations(): Promise<{ swept: number }> {
       }
     }
 
-    await Promise.all(
-      Array.from(adjustments.values()).map(({ productId, warehouseId, qty }) =>
-        tx.$executeRaw`
-          UPDATE "StockLevel"
-          SET "reservedUnits" = GREATEST("reservedUnits" - ${qty}, 0), "updatedAt" = NOW()
-          WHERE "productId" = ${productId} AND "warehouseId" = ${warehouseId}
-        `,
-      ),
-    );
+    // Sequential, not Promise.all: a Prisma interactive transaction runs on a
+    // single connection, so concurrent queries are unsafe (and serialized at
+    // best). Awaiting in order keeps the transaction well-behaved.
+    for (const { productId, warehouseId, qty } of adjustments.values()) {
+      await tx.$executeRaw`
+        UPDATE "StockLevel"
+        SET "reservedUnits" = GREATEST("reservedUnits" - ${qty}, 0), "updatedAt" = NOW()
+        WHERE "productId" = ${productId} AND "warehouseId" = ${warehouseId}
+      `;
+    }
 
     await tx.reservation.updateMany({
       where: { id: { in: expired.map((r) => r.id) } },

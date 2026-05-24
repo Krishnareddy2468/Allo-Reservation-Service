@@ -81,7 +81,7 @@ export function ReservationClient({ id }: { id: string }) {
     setActionLoading(true);
     setActionError(null);
     try {
-      const res = await fetch(`/api/reservations/${id}/cancel`, { method: "POST" });
+      const res = await fetch(`/api/reservations/${id}/release`, { method: "POST" });
       const body = (await res.json()) as Reservation | ApiError;
 
       if (res.ok) {

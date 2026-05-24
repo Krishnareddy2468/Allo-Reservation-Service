@@ -72,7 +72,11 @@ Flow on the server (`lib/idempotency.ts`):
 2. Look up `idem:{route}:{key}` in Redis.
    - **Key exists, hash matches** → return the stored `{status, body}` immediately, no DB work.
    - **Key exists, hash differs** → return `422 IDEMPOTENCY_KEY_REUSED`.
-   - **Key absent** → set an in-flight marker (`idem:inflight:{route}:{key}`, 30s TTL) to block concurrent retries, then perform the operation. After completion, write `{status, body, requestHash}` with a 24h TTL and delete the in-flight marker.
+   - **Key absent** → atomically claim an in-flight slot via `SET idem:inflight:{route}:{key} NX EX 30`.
+     - If we win the slot, perform the operation, then write `{status, body, requestHash}` with a 24h TTL and clear the in-flight marker (single Redis pipeline, one round-trip).
+     - If we lose the slot, another request with the same key is mid-flight. We poll the final key for up to 5 seconds; if it appears we serve it, otherwise we return `409` so the client can retry.
+
+The `SET ... NX` is the actual mutual-exclusion gate, so two simultaneous retries with the same key cannot both create a reservation.
 
 Limits (documented honestly):
 - The store lives only in Redis. If the Redis instance is flushed, stored responses are lost and a retry would be treated as a fresh request. Acceptable for a take-home; in production this would be backed by Postgres.
@@ -119,11 +123,13 @@ All error responses have shape `{ error: { code: string, message: string } }`.
 
 | Method | Path | Success | Errors |
 |---|---|---|---|
-| `GET` | `/api/products` | `200` products with stock | — |
-| `POST` | `/api/reservations` | `201` reservation | `400` validation, `409` NOT_ENOUGH_STOCK, `503` lock timeout |
-| `GET` | `/api/reservations/:id` | `200` reservation | `404` not found |
+| `GET` | `/api/products` | `200` products with stock per warehouse | — |
+| `GET` | `/api/warehouses` | `200` warehouses | — |
+| `POST` | `/api/reservations` | `201` reservation | `400` validation, `409` NOT_ENOUGH_STOCK, `409` idempotency in-flight, `422` IDEMPOTENCY_KEY_REUSED, `503` lock timeout |
+| `GET` | `/api/reservations/:id` | `200` reservation (lazily expired if past `expiresAt`) | `404` not found |
 | `POST` | `/api/reservations/:id/confirm` | `200` confirmed | `404`, `409` not pending, `410` RESERVATION_EXPIRED |
-| `POST` | `/api/reservations/:id/cancel` | `200` cancelled | `404`, `409` not pending |
+| `POST` | `/api/reservations/:id/release` | `200` released (held units returned to available stock) | `404`, `409` not pending |
+| `POST` | `/api/reservations/:id/cancel` | alias for `/release` (kept for backwards compatibility) | same as `/release` |
 | `POST` | `/api/cron/sweep-expired` | `200 { swept: N }` | `401` missing/wrong secret |
 
 ---
@@ -137,6 +143,8 @@ All error responses have shape `{ error: { code: string, message: string } }`.
 **Idempotency store is Redis-only.** It works for a take-home but a production version would persist results to Postgres so they survive a Redis flush.
 
 **Cron granularity.** Vercel's free-tier cron fires at most once per minute. Expiry precision is therefore ±1 minute for the sweep layer (lazy expiry on read is immediate).
+
+**`EXPIRED` vs `RELEASED`.** The spec mentions three statuses (pending, confirmed, released). We split the terminal "released" state into `RELEASED` (user/system cancelled while still valid) and `EXPIRED` (timer ran out) because the distinction is useful for ops and analytics. Both return the held units to available stock the same way.
 
 **`main` branch workflow.** I worked directly on `main` for speed. In a team context I'd use short-lived feature branches and PRs.
 

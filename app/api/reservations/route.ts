@@ -9,28 +9,45 @@ import {
   NotEnoughStockError,
 } from "@/lib/schemas";
 import { SESSION_COOKIE } from "@/middleware";
-import { checkIdempotency, saveIdempotencyResult } from "@/lib/idempotency";
+import {
+  checkIdempotency,
+  saveIdempotencyResult,
+  releaseIdempotencyInFlight,
+} from "@/lib/idempotency";
+
+const ROUTE = "POST /api/reservations";
 
 export async function POST(req: NextRequest) {
   const idempotencyKey = req.headers.get("Idempotency-Key");
   const rawBody = await req.text();
 
   if (idempotencyKey) {
-    const cached = await checkIdempotency("POST /api/reservations", idempotencyKey, rawBody);
-    if (cached === "REUSED") {
+    const outcome = await checkIdempotency(ROUTE, idempotencyKey, rawBody);
+    if (outcome.kind === "reused") {
       return apiError(
         ErrorCodes.IDEMPOTENCY_KEY_REUSED,
         "Idempotency-Key was already used with a different request body",
         422,
       );
     }
-    if (cached) return Response.json(cached.body, { status: cached.status });
+    if (outcome.kind === "cached") {
+      return Response.json(outcome.body, { status: outcome.status });
+    }
+    if (outcome.kind === "in_progress") {
+      return apiError(
+        ErrorCodes.LOCK_UNAVAILABLE,
+        "An identical request is still in progress — please retry shortly",
+        409,
+      );
+    }
+    // outcome.kind === "proceed": we own the in-flight slot
   }
 
   let body: z.infer<typeof ReserveBodySchema>;
   try {
     body = ReserveBodySchema.parse(JSON.parse(rawBody));
   } catch {
+    if (idempotencyKey) await releaseIdempotencyInFlight(ROUTE, idempotencyKey);
     return apiError(ErrorCodes.VALIDATION_ERROR, "Invalid request body", 400);
   }
 
@@ -42,6 +59,7 @@ export async function POST(req: NextRequest) {
     const result = await createReservation({ ...body, sessionId });
 
     if (result === null) {
+      if (idempotencyKey) await releaseIdempotencyInFlight(ROUTE, idempotencyKey);
       return apiError(
         ErrorCodes.LOCK_UNAVAILABLE,
         "Server is busy — please retry in a moment",
@@ -52,13 +70,15 @@ export async function POST(req: NextRequest) {
     reservation = result;
   } catch (err) {
     if (err instanceof NotEnoughStockError) {
+      if (idempotencyKey) await releaseIdempotencyInFlight(ROUTE, idempotencyKey);
       return apiError(ErrorCodes.NOT_ENOUGH_STOCK, "Not enough stock available", 409);
     }
+    if (idempotencyKey) await releaseIdempotencyInFlight(ROUTE, idempotencyKey);
     throw err;
   }
 
   if (idempotencyKey) {
-    await saveIdempotencyResult("POST /api/reservations", idempotencyKey, rawBody, {
+    await saveIdempotencyResult(ROUTE, idempotencyKey, rawBody, {
       status: 201,
       body: reservation,
     });

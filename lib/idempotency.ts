@@ -2,7 +2,9 @@ import { redis } from "./redis";
 import { createHash } from "crypto";
 
 const TTL_SECONDS = 60 * 60 * 24; // 24 hours
-const IN_FLIGHT_TTL_SECONDS = 30;  // max time for the actual operation
+const IN_FLIGHT_TTL_SECONDS = 30; // cap per-operation execution
+const POLL_INTERVAL_MS = 100;
+const POLL_MAX_ATTEMPTS = 50; // 50 × 100ms = 5s ceiling on waiting for an in-flight peer
 
 type StoredResult = {
   status: number;
@@ -10,12 +12,17 @@ type StoredResult = {
   requestHash: string;
 };
 
+export type IdempotencyOutcome =
+  | { kind: "cached"; status: number; body: unknown }
+  | { kind: "reused" }
+  | { kind: "in_progress" } // another request with same key is still running
+  | { kind: "proceed" };
+
 function hashBody(rawBody: string): string {
   return createHash("sha256").update(rawBody).digest("hex");
 }
 
 function redisKey(route: string, key: string): string {
-  // Namespace by route so the same key on different endpoints never collides
   return `idem:${route}:${key}`;
 }
 
@@ -23,40 +30,63 @@ function inFlightKey(route: string, key: string): string {
   return `idem:inflight:${route}:${key}`;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 /**
- * Check whether a cached response exists for this idempotency key.
+ * Check whether to short-circuit, wait, or proceed for this idempotency key.
  *
- * Returns:
- *   "REUSED"       — key exists but body hash differs (422 situation)
- *   StoredResult   — key exists and body matches (return the cached response)
- *   null           — key is new, proceed with the operation
- *
- * If the key is in-flight (another request is mid-operation), we wait a short
- * time and retry once, then fall through to let the DB handle it.
+ * Possible outcomes:
+ *   "cached"      — a finished response is in Redis. Return it.
+ *   "reused"      — a finished response is in Redis but the body hash differs (422).
+ *   "in_progress" — another request with this key is still running. Caller should
+ *                   return 409 (the client can retry, by which point we'll either
+ *                   serve the cached result or be free).
+ *   "proceed"     — no peer, no cache. We've claimed the in-flight slot and the
+ *                   caller MUST eventually call saveIdempotencyResult or
+ *                   releaseIdempotencyInFlight to free it.
  */
 export async function checkIdempotency(
   route: string,
   key: string,
   rawBody: string,
-): Promise<StoredResult | "REUSED" | null> {
+): Promise<IdempotencyOutcome> {
   const hash = hashBody(rawBody);
-  const rKey = redisKey(route, key);
+  const finalKey = redisKey(route, key);
+  const lockKey = inFlightKey(route, key);
 
-  const stored = await redis.get<StoredResult>(rKey);
-
-  if (stored) {
-    if (stored.requestHash !== hash) return "REUSED";
-    return stored;
+  const cached = await redis.get<StoredResult>(finalKey);
+  if (cached) {
+    if (cached.requestHash !== hash) return { kind: "reused" };
+    return { kind: "cached", status: cached.status, body: cached.body };
   }
 
-  // Mark in-flight so concurrent retries with the same key don't race
-  await redis.set(inFlightKey(route, key), "1", { ex: IN_FLIGHT_TTL_SECONDS, nx: true });
+  // Try to claim the in-flight slot. NX guarantees only one caller wins.
+  const claimed = await redis.set(lockKey, "1", {
+    nx: true,
+    ex: IN_FLIGHT_TTL_SECONDS,
+  });
 
-  return null;
+  if (claimed === "OK") return { kind: "proceed" };
+
+  // Lost the race. Poll briefly for the final result; if it never appears,
+  // surface IN_PROGRESS so the route returns a 409 the client can retry.
+  for (let i = 0; i < POLL_MAX_ATTEMPTS; i++) {
+    await sleep(POLL_INTERVAL_MS);
+    const result = await redis.get<StoredResult>(finalKey);
+    if (result) {
+      if (result.requestHash !== hash) return { kind: "reused" };
+      return { kind: "cached", status: result.status, body: result.body };
+    }
+  }
+
+  return { kind: "in_progress" };
 }
 
 /**
- * Store the result of a completed idempotent operation.
+ * Persist the response and free the in-flight slot in a single pipeline call
+ * so we don't pay two REST round-trips on the happy path.
  */
 export async function saveIdempotencyResult(
   route: string,
@@ -64,12 +94,20 @@ export async function saveIdempotencyResult(
   rawBody: string,
   result: { status: number; body: unknown },
 ): Promise<void> {
-  const hash = hashBody(rawBody);
-  const rKey = redisKey(route, key);
+  const toStore: StoredResult = { ...result, requestHash: hashBody(rawBody) };
+  const pipe = redis.pipeline();
+  pipe.set(redisKey(route, key), toStore, { ex: TTL_SECONDS });
+  pipe.del(inFlightKey(route, key));
+  await pipe.exec();
+}
 
-  const toStore: StoredResult = { ...result, requestHash: hash };
-
-  await redis.set(rKey, toStore, { ex: TTL_SECONDS });
-  // Clean up the in-flight marker
+/**
+ * Free the in-flight slot without writing a result — used when the operation
+ * fails partway and we don't want to cache an error as the canonical response.
+ */
+export async function releaseIdempotencyInFlight(
+  route: string,
+  key: string,
+): Promise<void> {
   await redis.del(inFlightKey(route, key));
 }
