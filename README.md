@@ -54,11 +54,15 @@ Every time `GET /api/reservations/:id` is called, the handler checks whether a P
 
 **2. Vercel Cron sweep** (`app/api/cron/sweep-expired/route.ts`, `vercel.json`)
 
-A cron job fires at `* * * * *` (every minute) and calls `POST /api/cron/sweep-expired`. It bulk-finds all `PENDING` reservations with `expiresAt < now()`, groups them by `(productId, warehouseId)` to batch the stock updates, and updates everything in a single Postgres transaction.
+A cron job calls `POST /api/cron/sweep-expired` on a schedule. The endpoint bulk-finds all `PENDING` reservations with `expiresAt < now()`, groups them by `(productId, warehouseId)` to batch the stock updates, and updates everything in a single Postgres transaction (sequential `$executeRaw` inside the interactive transaction — Prisma transactions run on a single connection, so concurrent queries inside one are unsafe).
 
-Together these ensure:
+The schedule in `vercel.json` is `0 3 * * *` (once daily at 03:00 UTC) because Vercel's Hobby plan caps cron jobs at one run per day. On a Pro account this would be `* * * * *` (every minute).
+
+Together these layers ensure:
 - A reservation that a user is actively viewing expires precisely when the countdown hits zero (next SWR poll, max 3 seconds after expiry).
-- Reservations no one is looking at (abandoned carts) are cleaned up within 1–2 minutes by the cron job.
+- Truly abandoned reservations (no one ever opens the page again) are reclaimed at the daily sweep, *or* the moment any other user views them or tries to reserve from the same SKU — `getReservation` runs the lazy-expiry transaction every time it's hit.
+
+In production, I'd replace the daily cron with **Upstash QStash** or **GitHub Actions** firing every minute against `/api/cron/sweep-expired` (the endpoint is already auth'd with `CRON_SECRET`). That gives sub-minute orphan cleanup without paying for Vercel Pro. The current setup is fine for a take-home demo because the lazy-on-read layer is what actually matters for the user-facing flow.
 
 ---
 
@@ -142,7 +146,7 @@ All error responses have shape `{ error: { code: string, message: string } }`.
 
 **Idempotency store is Redis-only.** It works for a take-home but a production version would persist results to Postgres so they survive a Redis flush.
 
-**Cron granularity.** Vercel's free-tier cron fires at most once per minute. Expiry precision is therefore ±1 minute for the sweep layer (lazy expiry on read is immediate).
+**Cron granularity.** Vercel's Hobby plan caps cron jobs at one run per day, so the deployed sweep runs daily at 03:00 UTC. Lazy expiry on read still flips each reservation to `EXPIRED` the instant a user (or any other shopper looking at the same SKU) views it, so the user-facing precision is ±3 seconds (the SWR poll interval) regardless of when the sweep runs. With more time / a paid plan I'd swap the sweep to per-minute via Upstash QStash or GitHub Actions, which is documented in the expiry section above.
 
 **`EXPIRED` vs `RELEASED`.** The spec mentions three statuses (pending, confirmed, released). We split the terminal "released" state into `RELEASED` (user/system cancelled while still valid) and `EXPIRED` (timer ran out) because the distinction is useful for ops and analytics. Both return the held units to available stock the same way.
 
