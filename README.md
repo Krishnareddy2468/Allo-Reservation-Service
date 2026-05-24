@@ -2,7 +2,7 @@
 
 A checkout-reservation system for multi-warehouse inventory. When a customer proceeds to checkout, a unit is held for 10 minutes. If payment succeeds (simulated here by "Confirm purchase"), the stock is permanently decremented. If the timer runs out or they cancel, the hold is released.
 
-Live URL: *(add after deploy)*
+Live URL:https://allo-reservation-service-956mxg8xu.vercel.app/products
 
 ---
 
