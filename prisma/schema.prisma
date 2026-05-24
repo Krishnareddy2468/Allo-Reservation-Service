@@ -21,7 +21,8 @@ model Product {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  stockLevels StockLevel[]
+  stockLevels  StockLevel[]
+  reservations Reservation[]
 }
 
 model Warehouse {
@@ -32,7 +33,8 @@ model Warehouse {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  stockLevels StockLevel[]
+  stockLevels  StockLevel[]
+  reservations Reservation[]
 }
 
 model StockLevel {
@@ -50,4 +52,33 @@ model StockLevel {
   // UPDATE in the reserve path can target a single row.
   @@unique([productId, warehouseId])
   @@index([warehouseId])
+}
+
+enum ReservationStatus {
+  PENDING
+  CONFIRMED
+  RELEASED
+  EXPIRED
+}
+
+model Reservation {
+  id          String            @id @default(cuid())
+  productId   String
+  warehouseId String
+  sessionId   String
+  quantity    Int
+  status      ReservationStatus @default(PENDING)
+  expiresAt   DateTime
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  product   Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  // (status, expiresAt) powers the expiry sweeper:
+  // WHERE status = 'PENDING' AND expiresAt < now().
+  @@index([status, expiresAt])
+  // sessionId index supports "my reservations" lookups for the cookie-based identity.
+  @@index([sessionId])
+  @@index([productId, warehouseId])
 }
